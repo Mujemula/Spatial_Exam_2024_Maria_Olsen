@@ -11,7 +11,7 @@ This repository includes relevant code and data for the Spatial Exam Project 202
 
 ### Data used to produce the data used for ABM
 **FOLK1AM.csv** <br>
-**gadm42_DK_2.shp** <br>
+**gadm42_DK_2.XXX** (list of shape files)<br>
 **Municipality_code_ranges.csv** <br>
 
 ### Data produced in the R markdowns 

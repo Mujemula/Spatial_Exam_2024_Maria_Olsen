@@ -1,0 +1,305 @@
+---
+title: "event_match_making_ABM"
+author: "maria"
+date: "2024-06-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+pacman::p_load(tidyverse,
+               tidyr,
+               stringr,
+               lubridate,
+               uuid,
+               dplyr,
+               leaflet,
+               readr,
+               sf,
+               #raster,
+               rnaturalearth,
+               rnaturalearthdata,
+               BiocManager,
+               devtools,
+               geosphere,
+               leaflet.extras) #maybe not nessisary
+
+# SETTING SEED FOR REPRODUCABILITY
+set.seed(42)
+```
+
+# LOADING IN DATA FOR ABM
+```{r}
+scaled_data <- read_csv("scaled_data.csv")
+all_events <- read_csv("all_events.csv")
+
+# CONVERTING COLUMNS TO LISTS OF CHARACTER VECTORS 
+scaled_data$neighbors <- strsplit(scaled_data$neighbors, ", ")
+scaled_data$event_category <- strsplit(scaled_data$event_category, ", ")
+```
+
+
+
+### CREATING FUNCTIONS FOR THE ABM
+
+```{r}
+# FUNCTION TO FIND EVENTS BASED ON AGENT PREFERENCES 
+find_events <- function(agent, events) {
+  # DETERMINE THE TRAVEL RANGE BASED ON TRAVEL_WILLINGNESS 
+  if (agent$travel_willingness == "in_city") {
+    possible_events <- events %>% filter(Venue_Name == agent$Municipality)
+  } else if (agent$travel_willingness == "neighbouring") {
+    neighboring_cities <- agent$neighbors
+    neighbor_list <- c()
+    neighbor_list[1] <- agent$Municipality
+    for (i in 1:length(neighboring_cities[[1]])){
+      neighbor_list[i+1] <- neighboring_cities[[1]][i+1]
+    }
+    possible_events <- events %>% filter(Venue_Name %in% neighbor_list)
+  } else if (agent$travel_willingness == "region") {
+    area <- get_area(agent$city, events)
+    possible_events <- events %>% filter(Region == area)
+  } else if (agent$travel_willingness == "anywhere") {
+    possible_events <- events
+  } else {
+    possible_events <- tibble() 
+  }
+
+  # FILTER BY EVENT PREFERENCES
+  preferred_events <- possible_events %>% 
+    filter(Event_Name %in% agent$event_category[[1]])
+  #preferred_events <- possible_events
+   
+  return(preferred_events)
+}
+
+
+
+# FUNCTION TO INITIALIZE RANDOM DAYS FOR EACH AGENT BASED ON THEIR EVENT ATTENDANCE FREQUENCY 
+initialize_search_days <- function(agent, simulation_days) {
+  if (agent$event_freq == "once a month") {
+    search_day <- sample(simulation_days, 1)
+  } else if (agent$event_freq == "once a week") {
+    search_day <- sample(simulation_days, length(simulation_days) %/% 7, replace = TRUE)
+  } else if (agent$event_freq == "multiple times a week") {
+    search_day <- list(sample(simulation_days, length(simulation_days) %/% 3, replace = TRUE))
+  } else {
+    search_day <- NULL
+  }
+  
+  return(search_day)
+}
+
+
+# FUNCTION TO CHECK IF AN AGENT SHOULD SEARCH FOR EVENTS ON A GIVEN DAY 
+should_search_for_event <- function(agent, search_day, day) {
+  if (agent$event_freq == "Once a month") {
+    return(day == search_day)
+  } else if (agent$event_freq == "once a week") {
+    return(day %in% search_day)
+  } else if (agent$event_freq == "multiple times a week") {
+    return(day %in% search_day)
+  } else if (agent$event_freq == "rarely") {
+    return(runif(1) > 0.5)
+  } else {
+    return(FALSE)
+  }
+}
+
+
+# FUNCTION TO FILTER POTENTIAL MATCHES BASED ON PREFFERED AGE THAT AN AGENT WANTS TO CONNECTS WITH 
+filter_potential_matches_age <- function(agent, people) {
+  if (agent$age_connect == "older") {
+    potential_matches <- people %>%
+      filter(age >= agent$age)
+  } else if (agent$age_connect == "younger") {
+    potential_matches <- people %>%
+      filter(age <= agent$age)
+  } else if (agent$age_connect == "same") {
+    potential_matches <- people %>%
+      filter(abs(age - agent$age) <= 3)
+  } else {
+    potential_matches <- people
+  }
+  
+  return(potential_matches)
+}
+
+
+# FUNCTION TO FILTER POTENTIAL MATCHES BASED ON PREFERED GENDER THAT AN AGENT WANTS TO CONNECT WITH
+filter_potential_matches_gender <- function(agent, people) {
+  gender_pref <- unlist(strsplit(agent$gender_connect, ", "))
+  
+  potential_IDs <- c()
+  
+  for (i in 1:nrow(people)) {
+    if (people[i, ]$gender %in% gender_pref) {
+      potential_IDs[i] = people$ID[i] 
+    }
+  }
+  
+  potential_IDs <- potential_IDs[!is.na(potential_IDs)]
+  
+  potential_gender_matches <- people %>% 
+    filter(ID %in% potential_IDs)
+  
+  return(potential_gender_matches)
+}
+
+
+
+# FUNCTION TO CHOOSE AN EVENT AND SUGGEST A MATCH
+choose_event_and_match <- function(agent, events, people) {
+  possible_events <- find_events(agent, events)
+  
+  if (nrow(possible_events) == 0) return(NULL) 
+  
+  chosen_event <- sample_n(possible_events, 1)
+  
+  ages_pref <- filter_potential_matches_age(agent, people)
+  potential_matches <- filter_potential_matches_gender(agent, ages_pref)
+  
+  if (nrow(potential_matches) == 0) return(NULL)
+  
+  return(list(event = chosen_event, match = potential_matches)) 
+}
+
+
+
+```
+
+
+
+### RUNNING THE ABM SIMULATION (TAKES Some minutes TO RUN)
+
+```{r}
+# INITIALIZING PEOPLE_DATA WITH NECESSARY COLUMNS AND EVENTS_DATA
+people_data <- scaled_data
+events_data <- all_events
+people_data$considering_event <- NA
+people_data$potential_matches <- vector("list", nrow(people_data))
+people_data$attending_events <- vector("list", nrow(people_data))
+people_data$attending_with <- vector("list", nrow(people_data))
+
+
+# DEFINING THE SIMULATION PERIOD (FROM 1ST OF JUNE TO 30TH OF JUNE 2024) 
+simulation_days <- seq(as.Date("2024-06-01"), as.Date("2024-06-30"), by="day")
+
+# RUNNING THE SIMULATION 
+for (day in simulation_days) {
+  # CREATING A VECTOR TO KEEP TRACK OF MATCHED IDS 
+  matched_ids <- c()
+  
+  # CHECKING FOR POTENTIAL MATCHES 
+  for (i in 1:nrow(people_data)) {
+    agent <- people_data[i, ]
+    
+    # INITIALIZING SEARCH DAYS 
+    search_day <- initialize_search_days(agent, simulation_days)
+    
+    
+    # CHECKING IF AN AGENT SHOULD SEARCH FOR AN EVENT BASED ON THEIR EVENT FREQUENCY 
+    if (should_search_for_event(agent, search_day, day)) {
+      result <- choose_event_and_match(agent, events_data, people_data)
+      
+      if (!is.null(result)) {
+        chosen_event <- result$event
+        chosen_matches <- result$match
+        
+        # MARKING THE AGENT AS CONSIDERING THE EVENT AND POTENTIAL MATCHES
+        people_data$considering_event[i] <- chosen_event$Event_ID
+        
+        if (!is.null(chosen_matches)){
+          potential_ids <- chosen_matches$ID
+          people_data$potential_matches[[i]] <- potential_ids
+        }
+        
+      }
+    }
+  }
+  
+  # CHECKING FOR POTENTIAL MATCHES 
+  for (i in 1:nrow(people_data)) {
+    agent <- people_data[i, ]
+  
+    # LOOKING FOR OTHERS WANTING TO ATTEND THE SAME EVENT 
+    same_event <- people_data %>% 
+      filter(agent$considering_event == considering_event)
+  
+    # FILTERING OUT THE AGENT
+    same_event <- same_event %>%
+      filter(ID != agent$ID)
+  
+    # IF THERE ARE POTENTIAL MATCHES, CHOOSING ONE MATCH
+    if (nrow(same_event) > 0) {
+      matches_that_day <- c()
+      
+      for (j in 1:nrow(same_event)) { 
+        random_index <- sample(nrow(same_event), 1) 
+        random_person <- same_event[random_index, ]
+  
+        if (!(random_person$ID %in% matched_ids) && !(random_person$ID %in% agent$attending_with[[1]])) {
+          if (agent$ID %in% random_person$potential_matches[[1]]) {
+            people_data$attending_events[i][[1]] <- append(people_data$attending_events[i][[1]], agent$considering_event[1])
+            
+            matches_that_day <- append(matches_that_day, random_person$ID[1])
+            
+            # ADDING THE MATCHED ID TO THE MATCHED_IDS VECTOR (ENSURING ONLY ONE MATCH PER DAY)
+            matched_ids <- append(matched_ids, random_person$ID)
+            
+          } else {
+            print("No Match")
+          }
+        } else {
+          print("No match")
+        }
+      }
+      # MARKING THE AGENTS AS A MATCH 
+      if (length(matches_that_day) > 0){
+        day_match <- sample(matches_that_day, 1)
+        people_data$attending_with[i][[1]] <- append(people_data$attending_with[i][[1]], day_match)
+        
+        # FINING THE ROW INDEX FOR DAY_MATCH 
+        day_match_index <- which(people_data$ID == day_match)
+        
+        # UPDATING THE PEOPLE DATAFRAME WITH MATCH AND ATTENDING EVENTS
+        people_data$attending_with[day_match_index][[1]] <- append(people_data$attending_with[day_match_index][[1]], agent$ID)
+        people_data$attending_events[day_match_index][[1]] <- append(people_data$attending_events[day_match_index][[1]], agent$considering_event[1])
+        
+        
+        print("It's a Match!")
+      }
+    }
+  }
+  # RESETTING THE CONSIDERING COLUMNS FOR THE NEXT DAY 
+  people_data$considering_event <- NA
+  people_data$potential_matches[[1]] <- NA
+  
+}  
+
+```
+
+# MAKING AN DATAFRAME WITH RESULTS FROM THE ABM AND SAVING IT IN CURRENT DICTIONARY 
+```{r}
+# FILTERING ROWS WHERE ATTENDING_EVENT IS NOT EMPTY 
+matched_people <- people_data %>%
+  filter(sapply(attending_events, function(x) length(x) > 0)) %>% 
+  select(-considering_event, -potential_matches)
+
+# CONVERTING THE LIST COLUMNS INTO STRINGS SO IT CAN BE SAVED AS A CSV FILE
+matched_people$neighbors <- sapply(matched_people$neighbors, toString)
+matched_people$event_category <- sapply(matched_people$event_category, toString)
+matched_people$attending_events <- sapply(matched_people$attending_events, toString)
+matched_people$attending_with <- sapply(matched_people$attending_with, toString)
+
+
+# SAVING TO CSV FILES 
+#write.csv(matched_people, "matched_people.csv", row.names = FALSE)
+```
+
+
+
+
+
+
